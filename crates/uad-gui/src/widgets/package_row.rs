@@ -21,6 +21,9 @@ pub struct PackageRow {
     pub list: UadList,
     pub selected: bool,
     pub current: bool,
+    /// `false` for third-party (user-installed) apps like Netflix; `true` for
+    /// system packages. Set during load from `pm list packages -3`.
+    pub is_system: bool,
 }
 
 /// Best-effort human label derived from a package id, used when no AI or curated
@@ -92,6 +95,7 @@ impl PackageRow {
             list,
             selected,
             current,
+            is_system: true,
         }
     }
 
@@ -235,6 +239,7 @@ impl From<CorePackage> for PackageRow {
             list: core.list,
             selected: false, // Default to not selected
             current: false,  // Default to not current
+            is_system: true,
         }
     }
 }
@@ -250,6 +255,7 @@ impl From<&CorePackage> for PackageRow {
             list: core.list,
             selected: false,
             current: false,
+            is_system: true,
         }
     }
 }

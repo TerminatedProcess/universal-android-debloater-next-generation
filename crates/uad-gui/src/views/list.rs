@@ -72,6 +72,8 @@ pub struct List {
     fallback_notifications: Vec<String>,
     /// True while an AI-enrichment batch is in flight (disables the button).
     ai_enriching: bool,
+    /// When true, show only third-party (user-installed) apps.
+    user_apps_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +106,8 @@ pub enum Message {
     DescriptionEdit(text_editor::Action),
     CopyError(String),
     HideCopyConfirmation,
+    /// Toggle showing only third-party (user-installed) apps.
+    ToggleUserAppsOnly(bool),
     /// Enrich all visible unknown packages with AI names/descriptions.
     AiEnrich,
     /// Results of an enrichment batch: `(row_index, package_name, info)`.
@@ -184,6 +188,11 @@ impl List {
             Message::HideCopyConfirmation => self.on_hide_copy_confirmation(),
             Message::AiEnrich => self.on_ai_enrich(),
             Message::AiEnriched(results) => self.on_ai_enriched(results),
+            Message::ToggleUserAppsOnly(on) => {
+                self.user_apps_only = on;
+                Self::filter_package_lists(self);
+                Task::none()
+            }
         }
     }
 
@@ -382,6 +391,18 @@ impl List {
         )
         .width(150);
 
+        // Show only third-party (user-installed) apps, e.g. Netflix.
+        let user_apps_toggle = row![
+            checkbox(self.user_apps_only)
+                .on_toggle(Message::ToggleUserAppsOnly)
+                .size(20)
+                .style(style::CheckBox::SettingsEnabled)
+                .spacing(4),
+            text("User apps").size(14),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+
         // Fills friendly names + descriptions for unknown packages via the local
         // AI proxy. Disabled while a batch is running.
         let ai_button = {
@@ -405,6 +426,7 @@ impl List {
             removal_picklist,
             package_state_picklist,
             list_picklist,
+            user_apps_toggle,
             ai_button,
         ]
         .width(Length::Fill)
@@ -846,6 +868,7 @@ impl List {
         let removal_filter: Removal = self
             .selected_removal
             .expect("removal recommendation must be selected");
+        let user_apps_only = self.user_apps_only;
 
         self.filtered_packages = self.phone_packages
             [self.selected_user.expect("User must be selected").index]
@@ -854,9 +877,15 @@ impl List {
             // that's why `enumerate` is before `filter`.
             .enumerate()
             .filter(|(_, p)| {
-                (list_filter == UadList::All || p.list == list_filter)
+                // In "user apps only" mode, drop system packages and ignore the
+                // removal-tier filter (those tiers describe the curated debloat
+                // lists, which don't apply to user-installed apps).
+                (!user_apps_only || !p.is_system)
+                    && (list_filter == UadList::All || p.list == list_filter)
                     && (package_filter == PackageState::All || p.state == package_filter)
-                    && (removal_filter == Removal::All || p.removal == removal_filter)
+                    && (user_apps_only
+                        || removal_filter == Removal::All
+                        || p.removal == removal_filter)
                     && (self.input_value.is_empty()
                         || matches_search(&p.name, &self.input_value, Some(&p.description)))
             })
@@ -875,8 +904,11 @@ impl List {
         // descriptions for otherwise-unknown packages). Purely from disk — no
         // network here, so load stays fast and works offline.
         let ai_cache = uad_core::ai::load_cache();
-        let apply_cache = |mut rows: Vec<PackageRow>| -> Vec<PackageRow> {
+        // Mark third-party (user-installed) apps and overlay cached AI data.
+        let finish = |mut rows: Vec<PackageRow>, uid: Option<u16>| -> Vec<PackageRow> {
+            let third_party = uad_core::utils::list_third_party_packages(serial, uid);
             for row in &mut rows {
+                row.is_system = !third_party.contains(&row.name);
                 if let Some(info) = ai_cache.get(&row.name) {
                     if !info.friendly_name.is_empty() {
                         row.friendly_name = info.friendly_name.clone();
@@ -892,21 +924,23 @@ impl List {
             rows
         };
         if user_list.len() <= 1 {
-            vec![apply_cache(
+            vec![finish(
                 fetch_packages(&uad_list, serial, None)
                     .into_iter()
                     .map(PackageRow::from)
                     .collect(),
+                None,
             )]
         } else {
             user_list
                 .iter()
                 .map(|user| {
-                    apply_cache(
+                    finish(
                         fetch_packages(&uad_list, serial, Some(user.id))
                             .into_iter()
                             .map(PackageRow::from)
                             .collect(),
+                        Some(user.id),
                     )
                 })
                 .collect()

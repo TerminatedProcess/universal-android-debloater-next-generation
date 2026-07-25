@@ -65,6 +65,19 @@ pub enum Error {
     DialogClosed,
 }
 
+/// Package ids of third-party (user-installed) apps, including uninstalled ones.
+/// Used to distinguish user apps (e.g. Netflix) from system packages.
+#[must_use]
+pub fn list_third_party_packages(device_serial: &str, user_id: Option<u16>) -> HashSet<String> {
+    AdbCommand::new()
+        .shell(device_serial)
+        .pm()
+        .list_packages_3rd(Some(PmListPacksFlag::IncludeUninstalled), user_id)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
 #[must_use]
 pub fn fetch_packages(
     uad_lists: &PackageHashMap,
