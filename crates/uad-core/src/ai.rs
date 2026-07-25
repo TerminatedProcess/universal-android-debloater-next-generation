@@ -139,7 +139,7 @@ pub fn chat(system: &str, prompt: &str) -> Option<String> {
         "prompt": prompt,
         "system": system,
         "max_tokens": 600,
-        "temperature": 0.4,
+        "temperature": 0.2,
     });
     match builder.send_json(&payload) {
         Ok(mut resp) => {

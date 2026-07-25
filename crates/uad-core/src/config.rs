@@ -183,12 +183,14 @@ mod tests {
     // the `[general]` / `[[devices]]` tables, else the emitted TOML is invalid.
     #[test]
     fn test_last_device_roundtrip() {
-        let mut config = Config::default();
-        config.last_device_id = Some("ABC123SERIAL".to_string());
-        config.devices.push(DeviceSettings {
-            device_id: "ABC123SERIAL".to_string(),
-            ..DeviceSettings::default()
-        });
+        let config = Config {
+            last_device_id: Some("ABC123SERIAL".to_string()),
+            devices: vec![DeviceSettings {
+                device_id: "ABC123SERIAL".to_string(),
+                ..DeviceSettings::default()
+            }],
+            ..Config::default()
+        };
         let toml = toml::to_string(&config).expect("serialize");
         // The scalar key must appear before any table header.
         let key_pos = toml.find("last_device_id").expect("key present");

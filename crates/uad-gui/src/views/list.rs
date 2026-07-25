@@ -3,6 +3,7 @@ use crate::style;
 use crate::theme::Theme;
 use crate::widgets::navigation_menu::ICONS;
 use log::{error, info, warn};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use uad_core::config::DeviceSettings;
 use uad_core::sync::{AdbError, Phone, User, apply_pkg_state_commands};
@@ -245,28 +246,32 @@ impl List {
             return Task::none();
         };
 
-        // Compact package context for the model.
-        let name = if pkg.friendly_name.is_empty() {
-            "(unknown)"
-        } else {
-            &pkg.friendly_name
-        };
-        let context = format!(
-            "Package id: {}\nApp name: {}\nType: {}\nUAD removal tier: {}\nKnown description: {}",
+        // Build context from only the fields we actually trust. The package id
+        // is the primary evidence — misleading "(unknown)"/placeholder lines are
+        // omitted so the model recognizes the id instead of being told it's
+        // unknown (which caused both "no idea" answers and hallucinations).
+        let is_placeholder =
+            pkg.description.is_empty() || pkg.description.starts_with("[No description]");
+        let mut context = format!(
+            "Package id: {}\nType: {}",
             pkg.name,
-            name,
             if pkg.is_system {
                 "system app"
             } else {
                 "user-installed app"
             },
-            pkg.removal,
-            if pkg.description.is_empty() {
-                "(none)"
-            } else {
-                &pkg.description
-            },
         );
+        if !pkg.friendly_name.is_empty() {
+            let _ = write!(context, "\nApp name: {}", pkg.friendly_name);
+        }
+        if !is_placeholder {
+            let _ = write!(context, "\nKnown description: {}", pkg.description);
+        }
+        // The removal tier is only meaningful for curated (listed) packages;
+        // for user apps it is just "Unlisted" and misleads the model.
+        if pkg.removal != Removal::Unlisted {
+            let _ = write!(context, "\nUAD removal tier: {}", pkg.removal);
+        }
 
         // Fold prior turns + the new question into a single prompt.
         let mut convo = String::new();
@@ -276,8 +281,12 @@ impl List {
             convo.push('\n');
         }
         let prompt = format!(
-            "You are advising whether to remove this Android package from the user's device.\n\n\
-             {context}\n\n{convo}User: {question}\nAssistant:"
+            "Help the user decide whether to remove this Android package from their device.\n\n\
+             {context}\n\n\
+             Identify the app from its package id — the reverse-domain id is strong evidence \
+             (e.g. com.netflix.ninja = Netflix on Android TV; com.amazon.* = an Amazon app). \
+             Explain what the app is and what removing it would affect.\n\n\
+             {convo}User: {question}\nAssistant:"
         );
 
         self.chat_history.push((true, question));
@@ -287,8 +296,11 @@ impl List {
             async move {
                 uad_core::ai::chat(
                     "You are a concise, practical Android package expert helping a user decide \
-                     whether to remove an app. Warn clearly if removal could break core device \
-                     functionality. Prefer 1-4 sentences.",
+                     whether to remove an app. Identify apps from their package id and reverse-domain \
+                     vendor. If a package id is genuinely obscure, say what can be inferred from the \
+                     vendor/domain and state plainly that the specifics are uncertain — never invent \
+                     features, permissions, or behavior you are not sure of. Warn clearly if removal \
+                     could break core device functionality. Prefer 1-4 sentences.",
                     &prompt,
                 )
             },
