@@ -1,0 +1,7 @@
+BUILD / RUN
+  build             cargo build --release
+  run               launch the deployed GUI, detached (frees the terminal)
+  deploy            install the GUI to your OS (~/.cargo/bin)
+
+FORK SYNC
+  gitupdate         sync fork from upstream
