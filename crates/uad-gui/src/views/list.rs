@@ -229,6 +229,14 @@ impl List {
 
     fn on_chat_send(&mut self) -> Task<Message> {
         let question = self.chat_input.trim().to_string();
+        self.chat_input.clear();
+        self.send_chat_question(&question)
+    }
+
+    /// Send an explicit question about the current chat package (used both by the
+    /// input box and by the auto-question fired when the chat first opens).
+    fn send_chat_question(&mut self, question: &str) -> Task<Message> {
+        let question = question.trim().to_string();
         if question.is_empty() || self.chat_pending {
             return Task::none();
         }
@@ -273,7 +281,6 @@ impl List {
         );
 
         self.chat_history.push((true, question));
-        self.chat_input.clear();
         self.chat_pending = true;
 
         Task::perform(
@@ -1364,16 +1371,22 @@ impl List {
                 // opens/refreshes the AI chat for this package; a single click
                 // returns the panel to the description view.
                 if open_chat {
-                    if !self.chat_mode || self.chat_pkg_index != i_package {
-                        self.chat_history.clear();
-                        self.chat_input.clear();
-                    }
+                    let new_chat = !self.chat_mode || self.chat_pkg_index != i_package;
                     self.chat_mode = true;
                     self.chat_pkg_index = i_package;
+                    if new_chat {
+                        self.chat_history.clear();
+                        self.chat_input.clear();
+                        // Auto-ask the question users would type anyway.
+                        return self.send_chat_question(
+                            "What is this app for, and can uninstalling it break anything?",
+                        );
+                    }
+                    Task::none()
                 } else {
                     self.chat_mode = false;
+                    Task::none()
                 }
-                Task::none()
             }
         }
     }
