@@ -1220,6 +1220,20 @@ impl List {
                                     error_modal,
                                 }
                             }
+                            // A package that has completely vanished from the device
+                            // (verify -> None) has effectively reached the Uninstalled
+                            // state: third-party apps removed with `--user 0` disappear
+                            // from `pm list packages` entirely. Treat absence as a
+                            // successful uninstall instead of a failed verification.
+                            None if wanted_state == PackageState::Uninstalled => {
+                                VerifyAndFallbackResult {
+                                    i_user,
+                                    index,
+                                    new_state: PackageState::Uninstalled,
+                                    notification: None,
+                                    error_modal: None,
+                                }
+                            }
                             actual_state_opt => {
                                 // Package doesn't exist (None) or has wrong state - try fallback
                                 let actual_state =
