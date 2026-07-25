@@ -167,7 +167,11 @@ impl UadGui {
                             .find(|phone| phone.adb_id == s_device.adb_id)
                             .cloned()
                     }
-                    None => devices_list.first().cloned(),
+                    // On first load, prefer the device remembered from last run,
+                    // falling back to the first connected device.
+                    None => uad_core::config::Config::last_device_id()
+                        .and_then(|id| devices_list.iter().find(|p| p.adb_id == id).cloned())
+                        .or_else(|| devices_list.first().cloned()),
                 };
                 self.devices_list = devices_list;
 
@@ -303,6 +307,8 @@ impl UadGui {
             }
             Message::DeviceSelected(s_device) => {
                 self.selected_device = Some(s_device.clone());
+                // Remember this choice for the next launch.
+                uad_core::config::Config::save_last_device(&s_device.adb_id);
                 self.view = View::List;
                 info!("{:-^65}", "-");
                 info!(

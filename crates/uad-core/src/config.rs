@@ -12,6 +12,13 @@ const DEFAULT_THEME: &str = "Auto (follow system theme)";
 
 #[derive(Default, Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
+    // NOTE: this scalar must be serialized before the `general`/`devices` tables
+    // — TOML requires top-level keys to precede any table headers, so keep it
+    // as the first field.
+    /// Serial (`adb_id`) of the most recently selected device, re-selected on
+    /// the next launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_device_id: Option<String>,
     pub general: GeneralSettings,
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
     pub devices: Vec<DeviceSettings>,
@@ -73,6 +80,30 @@ impl Config {
         self.general = general;
         let toml = toml::to_string(&self).unwrap();
         fs::write(&*CONFIG_FILE, toml).expect("Could not write config file to disk!");
+    }
+
+    /// Persist the most recently selected device serial (`adb_id`), so it is
+    /// re-selected automatically on the next launch.
+    pub fn save_last_device(device_id: &str) {
+        let mut config = Self::load_configuration_file();
+        if config.last_device_id.as_deref() == Some(device_id) {
+            return; // already current — avoid a needless disk write
+        }
+        config.last_device_id = Some(device_id.to_string());
+        match toml::to_string(&config) {
+            Ok(toml) => {
+                if let Err(e) = fs::write(&*CONFIG_FILE, toml) {
+                    error!("Could not write config file to disk: {e}");
+                }
+            }
+            Err(e) => error!("Could not serialize config: {e}"),
+        }
+    }
+
+    /// The most recently selected device serial (`adb_id`), if any.
+    #[must_use]
+    pub fn last_device_id() -> Option<String> {
+        Self::load_configuration_file().last_device_id
     }
 
     #[must_use]
@@ -146,5 +177,24 @@ mod tests {
     #[test]
     fn test_config_file_path() {
         assert_eq!(&*CONFIG_FILE, Path::new(&*CONFIG_DIR.join("config.toml")));
+    }
+
+    // Guards the TOML gotcha: `last_device_id` (a scalar) must serialize before
+    // the `[general]` / `[[devices]]` tables, else the emitted TOML is invalid.
+    #[test]
+    fn test_last_device_roundtrip() {
+        let mut config = Config::default();
+        config.last_device_id = Some("ABC123SERIAL".to_string());
+        config.devices.push(DeviceSettings {
+            device_id: "ABC123SERIAL".to_string(),
+            ..DeviceSettings::default()
+        });
+        let toml = toml::to_string(&config).expect("serialize");
+        // The scalar key must appear before any table header.
+        let key_pos = toml.find("last_device_id").expect("key present");
+        let table_pos = toml.find('[').expect("a table exists");
+        assert!(key_pos < table_pos, "scalar must precede tables:\n{toml}");
+        let parsed: Config = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(parsed.last_device_id.as_deref(), Some("ABC123SERIAL"));
     }
 }
