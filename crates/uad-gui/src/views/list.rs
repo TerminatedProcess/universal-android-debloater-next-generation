@@ -74,6 +74,19 @@ pub struct List {
     ai_enriching: bool,
     /// When true, show only third-party (user-installed) apps.
     user_apps_only: bool,
+    /// Last package-row click (index + time), for double-click detection.
+    last_package_click: Option<(usize, std::time::Instant)>,
+    /// When true, the bottom panel shows an AI conversation instead of the
+    /// package description.
+    chat_mode: bool,
+    /// `phone_packages` index the current chat is about.
+    chat_pkg_index: usize,
+    /// Conversation history: `(is_user, text)`.
+    chat_history: Vec<(bool, String)>,
+    /// Current chat input box contents.
+    chat_input: String,
+    /// True while awaiting an AI reply.
+    chat_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +121,14 @@ pub enum Message {
     HideCopyConfirmation,
     /// Toggle showing only third-party (user-installed) apps.
     ToggleUserAppsOnly(bool),
+    /// Chat: edit the question box.
+    ChatInputChanged(String),
+    /// Chat: send the current question.
+    ChatSend,
+    /// Chat: an AI reply arrived (or `None` on failure).
+    ChatResponse(Option<String>),
+    /// Chat: close the conversation and return to the description view.
+    ChatClose,
     /// Enrich all visible unknown packages with AI names/descriptions.
     AiEnrich,
     /// Results of an enrichment batch: `(row_index, package_name, info)`.
@@ -193,7 +214,88 @@ impl List {
                 Self::filter_package_lists(self);
                 Task::none()
             }
+            Message::ChatInputChanged(s) => {
+                self.chat_input = s;
+                Task::none()
+            }
+            Message::ChatSend => self.on_chat_send(),
+            Message::ChatResponse(reply) => self.on_chat_response(reply),
+            Message::ChatClose => {
+                self.chat_mode = false;
+                Task::none()
+            }
         }
+    }
+
+    fn on_chat_send(&mut self) -> Task<Message> {
+        let question = self.chat_input.trim().to_string();
+        if question.is_empty() || self.chat_pending {
+            return Task::none();
+        }
+        let i_user = self.selected_user.unwrap_or_default().index;
+        let Some(pkg) = self.phone_packages[i_user].get(self.chat_pkg_index) else {
+            return Task::none();
+        };
+
+        // Compact package context for the model.
+        let name = if pkg.friendly_name.is_empty() {
+            "(unknown)"
+        } else {
+            &pkg.friendly_name
+        };
+        let context = format!(
+            "Package id: {}\nApp name: {}\nType: {}\nUAD removal tier: {}\nKnown description: {}",
+            pkg.name,
+            name,
+            if pkg.is_system {
+                "system app"
+            } else {
+                "user-installed app"
+            },
+            pkg.removal,
+            if pkg.description.is_empty() {
+                "(none)"
+            } else {
+                &pkg.description
+            },
+        );
+
+        // Fold prior turns + the new question into a single prompt.
+        let mut convo = String::new();
+        for (is_user, text) in &self.chat_history {
+            convo.push_str(if *is_user { "User: " } else { "Assistant: " });
+            convo.push_str(text);
+            convo.push('\n');
+        }
+        let prompt = format!(
+            "You are advising whether to remove this Android package from the user's device.\n\n\
+             {context}\n\n{convo}User: {question}\nAssistant:"
+        );
+
+        self.chat_history.push((true, question));
+        self.chat_input.clear();
+        self.chat_pending = true;
+
+        Task::perform(
+            async move {
+                uad_core::ai::chat(
+                    "You are a concise, practical Android package expert helping a user decide \
+                     whether to remove an app. Warn clearly if removal could break core device \
+                     functionality. Prefer 1-4 sentences.",
+                    &prompt,
+                )
+            },
+            Message::ChatResponse,
+        )
+    }
+
+    fn on_chat_response(&mut self, reply: Option<String>) -> Task<Message> {
+        self.chat_pending = false;
+        let text = reply.unwrap_or_else(|| {
+            "⚠ AI unavailable (is the mcp-ai-proxy running on :6500?).".to_string()
+        });
+        self.chat_history.push((false, text));
+        Task::none()
     }
 
     /// Kick off AI enrichment for every currently-filtered package that has no
@@ -465,15 +567,90 @@ impl List {
             .height(Length::FillPortion(6))
             .style(style::Scrollable::Packages);
 
-        let description_scroll =
-            scrollable(text_editor(&self.description_content).on_action(Message::DescriptionEdit))
+        // Bottom panel: either the package description (default) or an AI
+        // conversation about the current package (opened by double-clicking a row).
+        let description_panel: Element<'_, Message, Theme, Renderer> = if self.chat_mode {
+            let i_user = self.selected_user.unwrap_or_default().index;
+            let pkg_name = self
+                .phone_packages
+                .get(i_user)
+                .and_then(|pkgs| pkgs.get(self.chat_pkg_index))
+                .map(|p| {
+                    if p.friendly_name.is_empty() {
+                        p.name.clone()
+                    } else {
+                        p.friendly_name.clone()
+                    }
+                })
+                .unwrap_or_default();
+
+            let header = row![
+                text(format!("Ask AI about: {pkg_name}")).style(style::Text::Default),
+                Space::new().width(Length::Fill),
+                button(text("Close"))
+                    .padding([2, 8])
+                    .on_press(Message::ChatClose),
+            ]
+            .align_y(Alignment::Center);
+
+            let mut msgs = column![].spacing(6).padding([4, 0]);
+            if self.chat_history.is_empty() {
+                msgs = msgs.push(
+                    text(
+                        "Ask a question to help you decide — e.g. \"What breaks if I remove this?\" \
+                         or \"Do I need this if I don't use Google Assistant?\"",
+                    )
+                    .style(style::Text::Commentary),
+                );
+            }
+            for (is_user, body) in &self.chat_history {
+                let prefix = if *is_user { "You: " } else { "AI: " };
+                let line = text(format!("{prefix}{body}")).style(if *is_user {
+                    style::Text::Default
+                } else {
+                    style::Text::Commentary
+                });
+                msgs = msgs.push(line);
+            }
+            if self.chat_pending {
+                msgs = msgs.push(text("AI: …thinking").style(style::Text::Commentary));
+            }
+
+            let history_scroll = scrollable(msgs)
+                .height(Length::Fill)
                 .style(style::Scrollable::Description);
 
-        let description_panel = container(description_scroll)
-            .padding(6)
-            .height(Length::FillPortion(2))
-            .width(Length::Fill)
-            .style(style::Container::Frame);
+            let input_row = row![
+                text_input("Ask a question…", &self.chat_input)
+                    .on_input(Message::ChatInputChanged)
+                    .on_submit(Message::ChatSend)
+                    .padding([5, 10]),
+                button(text("Send"))
+                    .padding([5, 10])
+                    .on_press(Message::ChatSend),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+
+            container(column![header, history_scroll, input_row].spacing(6))
+                .padding(6)
+                .height(Length::FillPortion(2))
+                .width(Length::Fill)
+                .style(style::Container::Frame)
+                .into()
+        } else {
+            let description_scroll = scrollable(
+                text_editor(&self.description_content).on_action(Message::DescriptionEdit),
+            )
+            .style(style::Scrollable::Description);
+
+            container(description_scroll)
+                .padding(6)
+                .height(Length::FillPortion(2))
+                .width(Length::Fill)
+                .style(style::Container::Frame)
+                .into()
+        };
 
         let review_selection = {
             let tmp_widget = text(format!(
@@ -1116,6 +1293,17 @@ impl List {
                 .map(move |row_message| Message::List(i_package, row_message));
         }
 
+        // Detect a double-click on a package row (two presses on the same row
+        // within 500ms) to open the AI chat panel.
+        let mut open_chat = false;
+        if matches!(*row_message, RowMessage::PackagePressed) {
+            let now = std::time::Instant::now();
+            open_chat = self.last_package_click.is_some_and(|(idx, t)| {
+                idx == i_package && now.duration_since(t) < std::time::Duration::from_millis(500)
+            });
+            self.last_package_click = Some((i_package, now));
+        }
+
         let package = &mut self.phone_packages[i_user][i_package];
 
         match *row_message {
@@ -1172,6 +1360,19 @@ impl List {
                     self.phone_packages[i_user][self.current_package_index].current = false;
                 }
                 self.current_package_index = i_package;
+                // `package` borrow has ended (last use above). A double-click
+                // opens/refreshes the AI chat for this package; a single click
+                // returns the panel to the description view.
+                if open_chat {
+                    if !self.chat_mode || self.chat_pkg_index != i_package {
+                        self.chat_history.clear();
+                        self.chat_input.clear();
+                    }
+                    self.chat_mode = true;
+                    self.chat_pkg_index = i_package;
+                } else {
+                    self.chat_mode = false;
+                }
                 Task::none()
             }
         }

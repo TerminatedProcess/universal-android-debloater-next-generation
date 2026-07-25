@@ -124,6 +124,36 @@ pub fn enrich_one(pkg_id: &str) -> Option<AiInfo> {
     }
 }
 
+/// Free-form chat turn against the AI proxy `/chat` endpoint.
+/// `system` sets the assistant's role; `prompt` is the full user turn
+/// (caller is responsible for embedding any package context and history).
+/// Returns the assistant's reply, or `None` on failure.
+#[must_use]
+pub fn chat(system: &str, prompt: &str) -> Option<String> {
+    let url = format!("{}/chat", proxy_url());
+    let mut builder = ureq::post(&url);
+    if let Ok(key) = std::env::var("UAD_AI_PROXY_KEY") {
+        builder = builder.header("Authorization", format!("Bearer {key}"));
+    }
+    let payload = serde_json::json!({
+        "prompt": prompt,
+        "system": system,
+        "max_tokens": 600,
+        "temperature": 0.4,
+    });
+    match builder.send_json(&payload) {
+        Ok(mut resp) => {
+            let val: serde_json::Value = resp.body_mut().read_json().ok()?;
+            let content = val.get("content")?.as_str()?.trim().to_string();
+            if content.is_empty() { None } else { Some(content) }
+        }
+        Err(e) => {
+            warn!("AI chat failed: {e}");
+            None
+        }
+    }
+}
+
 /// Enrich many package ids, up to `concurrency` requests at a time.
 /// Only successful lookups appear in the returned map.
 #[must_use]
