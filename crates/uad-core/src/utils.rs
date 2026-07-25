@@ -71,25 +71,49 @@ pub fn fetch_packages(
     device_serial: &str,
     user_id: Option<u16>,
 ) -> Vec<CorePackage> {
-    let all_sys_packs = AdbCommand::new()
+    let mut all_sys_packs = AdbCommand::new()
         .shell(device_serial)
         .pm()
         .list_packages_sys(Some(PmListPacksFlag::IncludeUninstalled), user_id)
         .unwrap_or_default();
-    let enabled_sys_packs: HashSet<String> = AdbCommand::new()
+    // Also include third-party (user-installed) apps — e.g. Netflix and other
+    // sideloaded/store apps. `pm list packages -s` only returns system packages,
+    // so without this they would never appear in the list.
+    all_sys_packs.extend(
+        AdbCommand::new()
+            .shell(device_serial)
+            .pm()
+            .list_packages_3rd(Some(PmListPacksFlag::IncludeUninstalled), user_id)
+            .unwrap_or_default(),
+    );
+    let mut enabled_sys_packs: HashSet<String> = AdbCommand::new()
         .shell(device_serial)
         .pm()
         .list_packages_sys(Some(PmListPacksFlag::OnlyEnabled), user_id)
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let disabled_sys_packs: HashSet<String> = AdbCommand::new()
+    enabled_sys_packs.extend(
+        AdbCommand::new()
+            .shell(device_serial)
+            .pm()
+            .list_packages_3rd(Some(PmListPacksFlag::OnlyEnabled), user_id)
+            .unwrap_or_default(),
+    );
+    let mut disabled_sys_packs: HashSet<String> = AdbCommand::new()
         .shell(device_serial)
         .pm()
         .list_packages_sys(Some(PmListPacksFlag::OnlyDisabled), user_id)
         .unwrap_or_default()
         .into_iter()
         .collect();
+    disabled_sys_packs.extend(
+        AdbCommand::new()
+            .shell(device_serial)
+            .pm()
+            .list_packages_3rd(Some(PmListPacksFlag::OnlyDisabled), user_id)
+            .unwrap_or_default(),
+    );
 
     let mut description;
     let mut removal;

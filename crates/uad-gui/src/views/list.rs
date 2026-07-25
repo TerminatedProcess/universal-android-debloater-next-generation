@@ -70,6 +70,8 @@ pub struct List {
     is_adb_satisfied: bool,
     copy_confirmation: bool,
     fallback_notifications: Vec<String>,
+    /// True while an AI-enrichment batch is in flight (disables the button).
+    ai_enriching: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +104,10 @@ pub enum Message {
     DescriptionEdit(text_editor::Action),
     CopyError(String),
     HideCopyConfirmation,
+    /// Enrich all visible unknown packages with AI names/descriptions.
+    AiEnrich,
+    /// Results of an enrichment batch: `(row_index, package_name, info)`.
+    AiEnriched(Vec<(usize, String, uad_core::ai::AiInfo)>),
 }
 
 pub struct SummaryEntry {
@@ -176,7 +182,83 @@ impl List {
             Message::DescriptionEdit(action) => self.on_description_edit(action),
             Message::CopyError(err) => self.on_copy_error(err),
             Message::HideCopyConfirmation => self.on_hide_copy_confirmation(),
+            Message::AiEnrich => self.on_ai_enrich(),
+            Message::AiEnriched(results) => self.on_ai_enriched(results),
         }
+    }
+
+    /// Kick off AI enrichment for every currently-filtered package that has no
+    /// friendly name yet (typically third-party and unknown system packages).
+    fn on_ai_enrich(&mut self) -> Task<Message> {
+        if self.ai_enriching {
+            return Task::none();
+        }
+        let i_user = self.selected_user.unwrap_or_default().index;
+        let targets: Vec<(usize, String)> = self
+            .filtered_packages
+            .iter()
+            .filter_map(|&i| {
+                let p = &self.phone_packages[i_user][i];
+                if p.friendly_name.is_empty() {
+                    Some((i, p.name.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if targets.is_empty() {
+            return Task::none();
+        }
+        self.ai_enriching = true;
+        Task::perform(Self::ai_enrich_task(targets), Message::AiEnriched)
+    }
+
+    /// Blocking network work, run off the UI (mirrors `load_packages`).
+    /// Enriches up to 6 packages concurrently and keeps the row index alongside
+    /// each result so the handler can update the right row.
+    #[expect(clippy::unused_async, reason = "matches load_packages call-site pattern")]
+    async fn ai_enrich_task(
+        targets: Vec<(usize, String)>,
+    ) -> Vec<(usize, String, uad_core::ai::AiInfo)> {
+        let names: Vec<String> = targets.iter().map(|(_, n)| n.clone()).collect();
+        let enriched = uad_core::ai::enrich_batch(&names, 6);
+        targets
+            .into_iter()
+            .filter_map(|(idx, name)| enriched.get(&name).map(|info| (idx, name, info.clone())))
+            .collect()
+    }
+
+    fn on_ai_enriched(
+        &mut self,
+        results: Vec<(usize, String, uad_core::ai::AiInfo)>,
+    ) -> Task<Message> {
+        self.ai_enriching = false;
+        let i_user = self.selected_user.unwrap_or_default().index;
+        // Persist to the on-disk cache so this cost is paid only once.
+        let mut cache = uad_core::ai::load_cache();
+        for (idx, name, info) in results {
+            if let Some(row) = self.phone_packages[i_user].get_mut(idx) {
+                if !info.friendly_name.is_empty() {
+                    row.friendly_name.clone_from(&info.friendly_name);
+                }
+                if !info.description.is_empty()
+                    && (row.description.is_empty()
+                        || row.description.starts_with("[No description]"))
+                {
+                    row.description.clone_from(&info.description);
+                    // Refresh the description panel if this is the open package.
+                    if idx == self.current_package_index {
+                        self.description = row.description.clone();
+                        self.description_content =
+                            text_editor::Content::with_text(&row.description);
+                    }
+                }
+            }
+            cache.insert(name, info);
+        }
+        uad_core::ai::save_cache(&cache);
+        Self::filter_package_lists(self);
+        Task::none()
     }
 
     // Handle verification completion on the UI thread after async work
@@ -300,6 +382,22 @@ impl List {
         )
         .width(150);
 
+        // Fills friendly names + descriptions for unknown packages via the local
+        // AI proxy. Disabled while a batch is running.
+        let ai_button = {
+            let label = if self.ai_enriching {
+                "Enriching…"
+            } else {
+                "AI names"
+            };
+            let btn = button(text(label)).padding([5, 10]);
+            if self.ai_enriching {
+                btn
+            } else {
+                btn.on_press(Message::AiEnrich).style(style::Button::Primary)
+            }
+        };
+
         row![
             col_sel_all,
             search_packages,
@@ -307,6 +405,7 @@ impl List {
             removal_picklist,
             package_state_picklist,
             list_picklist,
+            ai_button,
         ]
         .width(Length::Fill)
         .align_y(Alignment::Center)
@@ -772,21 +871,43 @@ impl List {
         user_list: Vec<User>,
     ) -> Vec<Vec<PackageRow>> {
         let serial = device_serial.as_ref();
+        // Overlay any previously-cached AI enrichment (friendly names +
+        // descriptions for otherwise-unknown packages). Purely from disk — no
+        // network here, so load stays fast and works offline.
+        let ai_cache = uad_core::ai::load_cache();
+        let apply_cache = |mut rows: Vec<PackageRow>| -> Vec<PackageRow> {
+            for row in &mut rows {
+                if let Some(info) = ai_cache.get(&row.name) {
+                    if !info.friendly_name.is_empty() {
+                        row.friendly_name = info.friendly_name.clone();
+                    }
+                    if !info.description.is_empty()
+                        && (row.description.is_empty()
+                            || row.description.starts_with("[No description]"))
+                    {
+                        row.description = info.description.clone();
+                    }
+                }
+            }
+            rows
+        };
         if user_list.len() <= 1 {
-            vec![
+            vec![apply_cache(
                 fetch_packages(&uad_list, serial, None)
                     .into_iter()
                     .map(PackageRow::from)
                     .collect(),
-            ]
+            )]
         } else {
             user_list
                 .iter()
                 .map(|user| {
-                    fetch_packages(&uad_list, serial, Some(user.id))
-                        .into_iter()
-                        .map(PackageRow::from)
-                        .collect()
+                    apply_cache(
+                        fetch_packages(&uad_list, serial, Some(user.id))
+                            .into_iter()
+                            .map(PackageRow::from)
+                            .collect(),
+                    )
                 })
                 .collect()
         }

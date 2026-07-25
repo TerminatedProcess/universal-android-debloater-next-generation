@@ -6,18 +6,63 @@ use log::warn;
 use uad_core::sync::{CorePackage, Phone};
 use uad_core::uad_lists::{PackageState, Removal, UadList};
 
-use iced::widget::{Space, button, checkbox, row};
+use iced::widget::{Space, button, checkbox, column, row};
 use iced::{Alignment, Element, Length, Renderer, Task, alignment};
 
 #[derive(Clone, Debug)]
 pub struct PackageRow {
     pub name: String,
+    /// Human-readable app name (from AI enrichment or curated data). Empty when
+    /// unknown — the row then falls back to [`prettify_pkg_id`] of `name`.
+    pub friendly_name: String,
     pub description: String,
     pub removal: Removal,
     pub state: PackageState,
     pub list: UadList,
     pub selected: bool,
     pub current: bool,
+}
+
+/// Best-effort human label derived from a package id, used when no AI or curated
+/// friendly name is available. `com.google.android.backdrop` -> `Backdrop`.
+#[must_use]
+pub fn prettify_pkg_id(id: &str) -> String {
+    let last = id.rsplit('.').next().unwrap_or(id);
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for ch in last.chars() {
+        if ch == '_' || ch == '-' {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        // Split camelCase boundaries (a|B).
+        if ch.is_uppercase() && prev_lower && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+        cur.push(ch);
+        prev_lower = ch.is_lowercase();
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    if words.is_empty() {
+        return last.to_string();
+    }
+    words
+        .iter()
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +85,7 @@ impl PackageRow {
     ) -> Self {
         Self {
             name: name.to_string(),
+            friendly_name: String::new(),
             description: description.to_string(),
             removal,
             state,
@@ -121,11 +167,42 @@ impl PackageRow {
             );
         }
 
+        // Friendly name (prominent) followed by the raw package id (dimmed,
+        // smaller). Falls back to a prettified id when no friendly name is known.
+        let display_name = if self.friendly_name.is_empty() {
+            prettify_pkg_id(&self.name)
+        } else {
+            self.friendly_name.clone()
+        };
+        let name_line = row![
+            text(display_name).size(16),
+            text(&self.name).size(12).style(style::Text::Commentary),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        // Optional inline description (first line only, dimmed). The unknown-package
+        // placeholder is suppressed so those rows stay compact.
+        let has_desc =
+            !self.description.is_empty() && !self.description.starts_with("[No description]");
+        let name_cell: Element<'_, Message, Theme, Renderer> = if has_desc {
+            let one_line = self.description.lines().next().unwrap_or_default().to_string();
+            column![
+                name_line,
+                text(one_line).size(12).style(style::Text::Commentary),
+            ]
+            .spacing(2)
+            .width(Length::FillPortion(8))
+            .into()
+        } else {
+            column![name_line].width(Length::FillPortion(8)).into()
+        };
+
         row![
             button(
                 row![
                     selection_checkbox,
-                    text(&self.name).width(Length::FillPortion(8)),
+                    name_cell,
                     action_btn.style(button_style)
                 ]
                 .spacing(8)
@@ -151,6 +228,7 @@ impl From<CorePackage> for PackageRow {
     fn from(core: CorePackage) -> Self {
         Self {
             name: core.name.clone(),
+            friendly_name: String::new(),
             description: core.description,
             removal: core.removal,
             state: core.state,
@@ -165,6 +243,7 @@ impl From<&CorePackage> for PackageRow {
     fn from(core: &CorePackage) -> Self {
         Self {
             name: core.name.clone(),
+            friendly_name: String::new(),
             description: core.description.clone(),
             removal: core.removal,
             state: core.state,

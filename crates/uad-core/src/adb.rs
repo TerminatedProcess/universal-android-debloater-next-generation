@@ -348,13 +348,37 @@ impl PmCommand {
     /// - isn't sorted
     /// - duplicates never _seem_ to happen, but don't assume uniqueness
     pub fn list_packages_sys(
+        self,
+        f: Option<PmListPacksFlag>,
+        user_id: Option<u16>,
+    ) -> Result<Vec<String>, String> {
+        self.list_packages_typed("-s", f, user_id)
+    }
+
+    /// `list packages -3` sub-command (third-party / user-installed apps,
+    /// e.g. Netflix and other sideloaded or store apps), [`PACK_PREFIX`]
+    /// stripped from each element. Same `Ok`/`Err` contract as
+    /// [`Self::list_packages_sys`].
+    pub fn list_packages_3rd(
+        self,
+        f: Option<PmListPacksFlag>,
+        user_id: Option<u16>,
+    ) -> Result<Vec<String>, String> {
+        self.list_packages_typed("-3", f, user_id)
+    }
+
+    /// Shared implementation for `pm list packages <type>`.
+    /// `type_flag` is `-s` (system) or `-3` (third-party).
+    fn list_packages_typed(
         mut self,
+        type_flag: &str,
         f: Option<PmListPacksFlag>,
         user_id: Option<u16>,
     ) -> Result<Vec<String>, String> {
         let cmd = &mut self.0.0.0;
 
-        cmd.args(["list", "packages", "-s"]);
+        cmd.args(["list", "packages"]);
+        cmd.arg(type_flag);
         if let Some(s) = f {
             cmd.arg(s.to_str());
         }
