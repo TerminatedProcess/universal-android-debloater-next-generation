@@ -3,10 +3,13 @@ use crate::style;
 use crate::theme::Theme;
 use crate::widgets::navigation_menu::ICONS;
 use log::{error, info, warn};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use uad_core::config::DeviceSettings;
-use uad_core::sync::{AdbError, Phone, User, apply_pkg_state_commands};
+use uad_core::config::{Config, DeviceSettings, FilterSettings};
+use uad_core::sync::{
+    AdbError, Phone, User, apply_pkg_state_commands, request_builder, supports_multi_user,
+};
 use uad_core::uad_lists::{
     Opposite, PackageHashMap, PackageState, Removal, UadList, UadListState, load_debloat_lists,
 };
@@ -31,6 +34,12 @@ pub struct PackageInfo {
     pub index: usize,
     pub removal: String,
     pub before_cross_user_states: Vec<(u16, PackageState)>,
+    /// State the queued command is trying to reach. Carried along rather than
+    /// re-derived at verification time, because the same package can be headed
+    /// somewhere different depending on which flow queued it (the row toggle
+    /// only ever flips enabled/disabled, while apply-selection honours
+    /// `disable_mode`). Unused by the backup-restore path.
+    pub wanted_state: PackageState,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -73,6 +82,13 @@ pub struct List {
     fallback_notifications: Vec<String>,
     /// True while an AI-enrichment batch is in flight (disables the button).
     ai_enriching: bool,
+    /// Set once a batch comes back completely empty (proxy down / all failed),
+    /// which stops the automatic naming chain for the rest of the session.
+    /// Pressing "AI names" clears it. Default `false` = auto-naming is on.
+    ai_auto_disabled: bool,
+    /// Package ids already sent for enrichment this session, so a name the AI
+    /// can't resolve is never automatically retried (and can't loop forever).
+    ai_attempted: HashSet<String>,
     /// When true, show only third-party (user-installed) apps.
     user_apps_only: bool,
     /// Last package-row click (index + time), for double-click detection.
@@ -130,11 +146,16 @@ pub enum Message {
     ChatResponse(Option<String>),
     /// Chat: close the conversation and return to the description view.
     ChatClose,
-    /// Enrich all visible unknown packages with AI names/descriptions.
-    AiEnrich,
+    /// Drop every filter, showing the device's full package list.
+    ClearFilters,
     /// Results of an enrichment batch: `(row_index, package_name, info)`.
     AiEnriched(Vec<(usize, String, uad_core::ai::AiInfo)>),
 }
+
+/// Packages named per automatic enrichment batch. Bounded so a fresh device
+/// (thousands of packages) resolves the visible rows first instead of firing
+/// one enormous burst at the proxy.
+const AI_AUTO_BATCH: usize = 40;
 
 pub struct SummaryEntry {
     category: Removal,
@@ -189,9 +210,7 @@ impl List {
             Message::List(i, row_msg) => self.on_list_row(i, &row_msg, settings, selected_device),
             Message::ApplyActionOnSelection => self.on_apply_action_on_selection(),
             Message::UserSelected(user) => self.on_user_selected(user),
-            Message::VerifyAndFallback(res) => {
-                self.on_verify_and_fallback(res, settings, selected_device)
-            }
+            Message::VerifyAndFallback(res) => self.on_verify_and_fallback(res, selected_device),
             Message::VerifyAndFallbackFinished(result) => {
                 self.on_verify_and_fallback_finished(result)
             }
@@ -208,12 +227,11 @@ impl List {
             Message::DescriptionEdit(action) => self.on_description_edit(action),
             Message::CopyError(err) => self.on_copy_error(err),
             Message::HideCopyConfirmation => self.on_hide_copy_confirmation(),
-            Message::AiEnrich => self.on_ai_enrich(),
+            Message::ClearFilters => self.on_clear_filters(),
             Message::AiEnriched(results) => self.on_ai_enriched(results),
             Message::ToggleUserAppsOnly(on) => {
                 self.user_apps_only = on;
-                Self::filter_package_lists(self);
-                Task::none()
+                self.apply_filter_change()
             }
             Message::ChatInputChanged(s) => {
                 self.chat_input = s;
@@ -318,35 +336,54 @@ impl List {
     }
 
     /// Kick off AI enrichment for every currently-filtered package that has no
-    /// friendly name yet (typically third-party and unknown system packages).
-    fn on_ai_enrich(&mut self) -> Task<Message> {
-        if self.ai_enriching {
-            return Task::none();
-        }
+    /// Packages in the current view still showing a derived placeholder name,
+    /// excluding ids already sent for enrichment this session.
+    fn unnamed_filtered_packages(&self, limit: usize) -> Vec<(usize, String)> {
         let i_user = self.selected_user.unwrap_or_default().index;
-        let targets: Vec<(usize, String)> = self
-            .filtered_packages
+        self.filtered_packages
             .iter()
             .filter_map(|&i| {
-                let p = &self.phone_packages[i_user][i];
-                if p.friendly_name.is_empty() {
-                    Some((i, p.name.clone()))
-                } else {
-                    None
-                }
+                let p = self.phone_packages.get(i_user)?.get(i)?;
+                (p.friendly_name.is_empty() && !self.ai_attempted.contains(&p.name))
+                    .then(|| (i, p.name.clone()))
             })
-            .collect();
-        if targets.is_empty() {
-            return Task::none();
+            .take(limit)
+            .collect()
+    }
+
+    fn start_enrich_batch(&mut self, targets: Vec<(usize, String)>) -> Task<Message> {
+        for (_, name) in &targets {
+            self.ai_attempted.insert(name.clone());
         }
         self.ai_enriching = true;
         Task::perform(Self::ai_enrich_task(targets), Message::AiEnriched)
     }
 
+    /// Enrich the packages the user is currently looking at, without being
+    /// asked. Runs in bounded batches and re-arms itself from
+    /// [`Self::on_ai_enriched`] until the visible list has no placeholder names
+    /// left, so browsing a long list resolves progressively instead of in one
+    /// giant burst. Results are cached on disk, so this costs one call per
+    /// package ever; with no proxy reachable the first batch returns nothing and
+    /// the chain stops.
+    fn maybe_auto_enrich(&mut self) -> Task<Message> {
+        if self.ai_auto_disabled || self.ai_enriching {
+            return Task::none();
+        }
+        let targets = self.unnamed_filtered_packages(AI_AUTO_BATCH);
+        if targets.is_empty() {
+            return Task::none();
+        }
+        self.start_enrich_batch(targets)
+    }
+
     /// Blocking network work, run off the UI (mirrors `load_packages`).
     /// Enriches up to 6 packages concurrently and keeps the row index alongside
     /// each result so the handler can update the right row.
-    #[expect(clippy::unused_async, reason = "matches load_packages call-site pattern")]
+    #[expect(
+        clippy::unused_async,
+        reason = "matches load_packages call-site pattern"
+    )]
     async fn ai_enrich_task(
         targets: Vec<(usize, String)>,
     ) -> Vec<(usize, String, uad_core::ai::AiInfo)> {
@@ -363,6 +400,13 @@ impl List {
         results: Vec<(usize, String, uad_core::ai::AiInfo)>,
     ) -> Task<Message> {
         self.ai_enriching = false;
+        // A batch where nothing came back means the proxy is unreachable (or
+        // rejecting us). Stop the automatic chain rather than hammering it once
+        // per batch; the "AI names" button re-arms it.
+        if results.is_empty() {
+            self.ai_auto_disabled = true;
+            return Task::none();
+        }
         let i_user = self.selected_user.unwrap_or_default().index;
         // Persist to the on-disk cache so this cost is paid only once.
         let mut cache = uad_core::ai::load_cache();
@@ -388,7 +432,8 @@ impl List {
         }
         uad_core::ai::save_cache(&cache);
         Self::filter_package_lists(self);
-        Task::none()
+        // Keep going while the visible list still has placeholder names.
+        self.maybe_auto_enrich()
     }
 
     // Handle verification completion on the UI thread after async work
@@ -524,23 +569,20 @@ impl List {
         .spacing(4)
         .align_y(Alignment::Center);
 
-        // Fills friendly names + descriptions for unknown packages via the local
-        // AI proxy. Disabled while a batch is running.
-        let ai_button = {
-            let label = if self.ai_enriching {
-                "Enriching…"
+        // Drops every filter at once, showing the device's full package list.
+        // Greyed out when nothing is filtered, so it doubles as an indicator of
+        // whether what you see is the whole picture.
+        let clear_filters_button = {
+            let btn = button(text("Clear filters")).padding([5, 10]);
+            if self.has_active_filters() {
+                btn.on_press(Message::ClearFilters)
+                    .style(style::Button::Primary)
             } else {
-                "AI names"
-            };
-            let btn = button(text(label)).padding([5, 10]);
-            if self.ai_enriching {
                 btn
-            } else {
-                btn.on_press(Message::AiEnrich).style(style::Button::Primary)
             }
         };
 
-        row![
+        let mut controls = row![
             col_sel_all,
             search_packages,
             user_picklist,
@@ -548,18 +590,25 @@ impl List {
             package_state_picklist,
             list_picklist,
             user_apps_toggle,
-            ai_button,
-        ]
-        .width(Length::Fill)
-        .align_y(Alignment::Center)
-        .spacing(6)
-        .padding(iced::Padding {
-            top: 0.0,
-            right: 16.0,
-            bottom: 0.0,
-            left: 0.0,
-        })
-        .into()
+            clear_filters_button,
+        ];
+        // Background AI naming has no button of its own any more, so surface it
+        // here while a batch is in flight.
+        if self.ai_enriching {
+            controls = controls.push(text("Naming…").size(14).style(style::Text::Commentary));
+        }
+
+        controls
+            .width(Length::Fill)
+            .align_y(Alignment::Center)
+            .spacing(6)
+            .padding(iced::Padding {
+                top: 0.0,
+                right: 16.0,
+                bottom: 0.0,
+                left: 0.0,
+            })
+            .into()
     }
 
     #[allow(
@@ -1240,14 +1289,19 @@ impl List {
         let i_user = self.selected_user.unwrap_or_default().index;
         self.phone_packages = packages;
         self.filtered_packages = (0..self.phone_packages[i_user].len()).collect();
-        self.selected_removal = Some(Removal::Recommended);
-        self.selected_package_state = Some(PackageState::Enabled);
-        self.selected_list = Some(UadList::All);
+        // Reopen on the view the user left last time (defaults match the
+        // previously hard-coded all lists / enabled / recommended).
+        let filters = Config::filters();
+        self.selected_removal = Some(filters.removal);
+        self.selected_package_state = Some(filters.state);
+        self.selected_list = Some(filters.list);
+        self.user_apps_only = filters.user_apps_only;
         self.selected_user = Some(User::default());
         self.fallback_notifications.clear();
         Self::filter_package_lists(self);
         self.loading_state = LoadingState::Ready;
-        Task::none()
+        // Start naming what the user is about to look at.
+        self.maybe_auto_enrich()
     }
 
     fn on_toggle_all_selected(
@@ -1281,20 +1335,55 @@ impl List {
 
     fn on_list_selected(&mut self, list: UadList) -> Task<Message> {
         self.selected_list = Some(list);
-        Self::filter_package_lists(self);
-        Task::none()
+        self.apply_filter_change()
     }
 
     fn on_package_state_selected(&mut self, package_state: PackageState) -> Task<Message> {
         self.selected_package_state = Some(package_state);
-        Self::filter_package_lists(self);
-        Task::none()
+        self.apply_filter_change()
     }
 
     fn on_removal_selected(&mut self, removal: Removal) -> Task<Message> {
         self.selected_removal = Some(removal);
+        self.apply_filter_change()
+    }
+
+    /// True when the list is showing anything less than every package of the
+    /// selected user.
+    fn has_active_filters(&self) -> bool {
+        self.selected_list.unwrap_or_default() != UadList::All
+            || self.selected_package_state.unwrap_or_default() != PackageState::All
+            || self.selected_removal.unwrap_or_default() != Removal::All
+            || self.user_apps_only
+            || !self.input_value.is_empty()
+    }
+
+    /// Show everything: every list, state and removal tier, system apps
+    /// included, search cleared.
+    fn on_clear_filters(&mut self) -> Task<Message> {
+        self.selected_list = Some(UadList::All);
+        self.selected_package_state = Some(PackageState::All);
+        self.selected_removal = Some(Removal::All);
+        self.user_apps_only = false;
+        self.input_value.clear();
+        self.apply_filter_change()
+    }
+
+    /// Re-filter after a filter widget changed, remember the new selection for
+    /// the next launch, and name whatever just came into view.
+    fn apply_filter_change(&mut self) -> Task<Message> {
         Self::filter_package_lists(self);
-        Task::none()
+        // Changing the view is also the natural moment to retry naming: a batch
+        // that failed wholesale (proxy down) parked the automatic chain, and
+        // ids already tried stay skipped, so this only reaches new packages.
+        self.ai_auto_disabled = false;
+        Config::save_filters(&FilterSettings {
+            list: self.selected_list.unwrap_or_default(),
+            state: self.selected_package_state.unwrap_or_default(),
+            removal: self.selected_removal.unwrap_or_default(),
+            user_apps_only: self.user_apps_only,
+        });
+        self.maybe_auto_enrich()
     }
 
     fn on_list_row(
@@ -1361,10 +1450,9 @@ impl List {
                 }
                 Task::none()
             }
-            RowMessage::ActionPressed => {
+            RowMessage::ToggleState => {
                 self.fallback_notifications.clear();
-                self.phone_packages[i_user][i_package].selected = true;
-                Task::batch(build_action_pkg_commands(
+                Task::batch(build_state_toggle_commands(
                     &self.phone_packages,
                     selected_device,
                     &settings.device,
@@ -1413,7 +1501,7 @@ impl List {
         self.fallback_notifications.clear();
         self.filtered_packages = (0..self.phone_packages[user.index].len()).collect();
         Self::filter_package_lists(self);
-        Task::none()
+        self.maybe_auto_enrich()
     }
 
     #[allow(
@@ -1427,7 +1515,6 @@ impl List {
     fn on_verify_and_fallback(
         &mut self,
         res: Result<PackageInfo, AdbError>,
-        settings: &Settings,
         selected_device: &Phone,
     ) -> Task<Message> {
         match res {
@@ -1437,7 +1524,10 @@ impl List {
                 let index = p.index;
                 let pkg_name = self.phone_packages[i_user][index].name.clone();
                 let current_state = self.phone_packages[i_user][index].state;
-                let wanted_state = current_state.opposite(settings.device.disable_mode);
+                // What the queueing flow actually asked for — re-deriving it
+                // here would mis-verify the row toggle, whose target ignores
+                // `disable_mode`.
+                let wanted_state = p.wanted_state;
                 let before_cross_user_states = p.before_cross_user_states.clone();
                 let device = selected_device.clone();
                 let user_id = device.user_list[i_user].id;
@@ -1885,24 +1975,130 @@ fn build_action_pkg_commands(
             u_pkg.state.opposite(settings.disable_mode)
         };
 
-        let actions = apply_pkg_state_commands(&u_pkg.into(), wanted_state, *u, device);
+        commands.append(&mut queue_state_change(
+            apply_pkg_state_commands(&u_pkg.into(), wanted_state, *u, device),
+            &u_pkg.name,
+            wanted_state,
+            *u,
+            device,
+            (selection.1, pkg.removal.to_string()),
+        ));
+    }
+    commands
+}
 
-        for (j, action) in actions.into_iter().enumerate() {
+/// Commands for the per-row state toggle.
+///
+/// Unlike apply-selection this never uninstalls and never consults
+/// `disable_mode`: it flips one package between `Enabled` and `Disabled` on the
+/// user being viewed, or on every unprotected user in multi-user mode.
+fn build_state_toggle_commands(
+    packages: &[Vec<PackageRow>],
+    device: &Phone,
+    settings: &DeviceSettings,
+    selection: (usize, usize),
+) -> Vec<Task<Message>> {
+    let (i_user, i_pkg) = selection;
+    let pkg = &packages[i_user][i_pkg];
+    let wanted_state = match pkg.state {
+        PackageState::Enabled => PackageState::Disabled,
+        PackageState::Disabled => PackageState::Enabled,
+        // Uninstalled packages have nothing to toggle — the view doesn't offer
+        // it, and restoring stays part of the select-and-apply flow.
+        PackageState::Uninstalled | PackageState::All => return vec![],
+    };
+
+    // A device that reported no users at all still has an implicit user 0.
+    let users: Vec<User> = if device.user_list.is_empty() {
+        vec![User::default()]
+    } else if settings.multi_user_mode {
+        device
+            .user_list
+            .iter()
+            .copied()
+            .filter(|u| !u.protected)
+            .collect()
+    } else {
+        device
+            .user_list
+            .iter()
+            .copied()
+            .filter(|u| u.index == i_user)
+            .collect()
+    };
+
+    users
+        .into_iter()
+        .flat_map(|u| {
+            let u_pkg = packages
+                .get(u.index)
+                .and_then(|p| p.get(i_pkg))
+                .unwrap_or(pkg);
+            queue_state_change(
+                state_toggle_actions(&u_pkg.name, wanted_state, u, device),
+                &u_pkg.name,
+                wanted_state,
+                u,
+                device,
+                (i_pkg, pkg.removal.to_string()),
+            )
+        })
+        .collect()
+}
+
+/// Commands behind the row toggle.
+///
+/// Deliberately *not* [`apply_pkg_state_commands`]: UAD's normal disable also
+/// runs `pm clear`, wiping the app's data. A one-click toggle has to be
+/// reversible, so this only force-stops and disables, leaving logins and
+/// settings intact.
+fn state_toggle_actions(
+    pkg_name: &str,
+    wanted_state: PackageState,
+    user: User,
+    device: &Phone,
+) -> Vec<String> {
+    let commands: &[&str] = match wanted_state {
+        // `pm disable-user` only exists from Android 6 (SDK 23).
+        PackageState::Disabled if device.android_sdk >= 23 => &["pm disable-user", "am force-stop"],
+        PackageState::Enabled => &["pm enable"],
+        _ => &[],
+    };
+    request_builder(
+        commands,
+        pkg_name,
+        supports_multi_user(device).then_some(user),
+    )
+}
+
+/// Turn ADB actions into tasks. Only the first reports back for verification —
+/// several commands still add up to a single state change.
+fn queue_state_change(
+    actions: Vec<String>,
+    pkg_name: &str,
+    wanted_state: PackageState,
+    user: User,
+    device: &Phone,
+    (index, removal): (usize, String),
+) -> Vec<Task<Message>> {
+    actions
+        .into_iter()
+        .enumerate()
+        .map(|(j, action)| {
             let p_info = PackageInfo {
-                i_user: u.index,
-                index: selection.1,
-                removal: pkg.removal.to_string(),
+                i_user: user.index,
+                index,
+                removal: removal.clone(),
                 // Will be filled asynchronously before running the adb action
                 before_cross_user_states: vec![],
+                wanted_state,
             };
             // Clone data before async block to avoid borrowing issues
             let device_serial = device.adb_id.clone();
-            let package_name = u_pkg.name.clone();
-            let user_id = u.id;
+            let package_name = pkg_name.to_string();
+            let user_id = user.id;
             let phone = device.clone();
-            // In the end there is only one package state change
-            // even if we run multiple adb commands
-            commands.push(Task::perform(
+            Task::perform(
                 async move {
                     run_adb_action_with_before_states(
                         &device_serial,
@@ -1918,10 +2114,9 @@ fn build_action_pkg_commands(
                 } else {
                     |_| Message::Nothing
                 },
-            ));
-        }
-    }
-    commands
+            )
+        })
+        .collect()
 }
 
 fn run_adb_action_with_before_states(

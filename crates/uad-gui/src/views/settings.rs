@@ -242,6 +242,9 @@ impl Settings {
                         index: p.index,
                         removal: "RESTORE".to_string(),
                         before_cross_user_states: vec![],
+                        // Restore reports through `RestoringDevice`, which does
+                        // no verification, so this is never read.
+                        ..PackageInfo::default()
                     };
                     for command in p.commands.clone() {
                         *nb_running_async_adb_commands += 1;
