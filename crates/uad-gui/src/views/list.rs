@@ -146,6 +146,8 @@ pub enum Message {
     ChatResponse(Option<String>),
     /// Chat: close the conversation and return to the description view.
     ChatClose,
+    /// Chat: forget the stored conversation and ask again from scratch.
+    ChatClear,
     /// Drop every filter, showing the device's full package list.
     ClearFilters,
     /// Results of an enrichment batch: `(row_index, package_name, info)`.
@@ -238,11 +240,76 @@ impl List {
                 Task::none()
             }
             Message::ChatSend => self.on_chat_send(),
+            Message::ChatClear => self.on_chat_clear(),
             Message::ChatResponse(reply) => self.on_chat_response(reply),
             Message::ChatClose => {
                 self.chat_mode = false;
                 Task::none()
             }
+        }
+    }
+
+    /// Question fired automatically when the chat panel opens — the one users
+    /// would type anyway.
+    const OPENING_QUESTION: &'static str =
+        "What is this app for, and can uninstalling it break anything?";
+
+    /// Package the chat panel is currently about.
+    fn chat_package_name(&self) -> Option<String> {
+        let i_user = self.selected_user.unwrap_or_default().index;
+        self.phone_packages
+            .get(i_user)
+            .and_then(|pkgs| pkgs.get(self.chat_pkg_index))
+            .map(|pkg| pkg.name.clone())
+    }
+
+    /// Open the conversation for the current package, replaying the stored
+    /// thread when there is one. Only a package never asked about costs a
+    /// round-trip; everything else is already known.
+    fn open_chat(&mut self) -> Task<Message> {
+        let Some(pkg_name) = self.chat_package_name() else {
+            return Task::none();
+        };
+        let stored = uad_core::ai::cached_chat(&pkg_name);
+        if stored.is_empty() {
+            return self.send_chat_question(Self::OPENING_QUESTION);
+        }
+        self.chat_history = stored
+            .into_iter()
+            .map(|turn| (turn.from_user, turn.text))
+            .collect();
+        Task::none()
+    }
+
+    /// Throw away the stored conversation and start it again from scratch —
+    /// the way to get a fresh answer when the cached one looks wrong.
+    fn on_chat_clear(&mut self) -> Task<Message> {
+        if let Some(pkg_name) = self.chat_package_name() {
+            uad_core::ai::clear_chat(&pkg_name);
+        }
+        self.chat_history.clear();
+        self.chat_input.clear();
+        if self.chat_pending {
+            // A reply is still in flight; it would be written back as if it
+            // belonged to the cleared thread. Let it land in an empty history.
+            return Task::none();
+        }
+        self.send_chat_question(Self::OPENING_QUESTION)
+    }
+
+    /// Persist the thread so reopening this package doesn't re-ask anything.
+    fn save_chat_history(&self) {
+        if let Some(pkg_name) = self.chat_package_name() {
+            uad_core::ai::save_chat(
+                &pkg_name,
+                self.chat_history
+                    .iter()
+                    .map(|(from_user, text)| uad_core::ai::ChatTurn {
+                        from_user: *from_user,
+                        text: text.clone(),
+                    })
+                    .collect(),
+            );
         }
     }
 
@@ -328,10 +395,15 @@ impl List {
 
     fn on_chat_response(&mut self, reply: Option<String>) -> Task<Message> {
         self.chat_pending = false;
-        let text = reply.unwrap_or_else(|| {
-            "⚠ AI unavailable (is the mcp-ai-proxy running on :6500?).".to_string()
-        });
+        let Some(text) = reply else {
+            self.chat_history.push((
+                false,
+                "⚠ AI unavailable (is the mcp-ai-proxy running on :6500?).".to_string(),
+            ));
+            return Task::none();
+        };
         self.chat_history.push((false, text));
+        self.save_chat_history();
         Task::none()
     }
 
@@ -428,7 +500,13 @@ impl List {
                     }
                 }
             }
-            cache.insert(name, info);
+            // Enrichment never produces a conversation, so carry any stored one
+            // across rather than dropping it.
+            let chat = cache
+                .get(&name)
+                .map(|cached| cached.chat.clone())
+                .unwrap_or_default();
+            cache.insert(name, uad_core::ai::AiInfo { chat, ..info });
         }
         uad_core::ai::save_cache(&cache);
         Self::filter_package_lists(self);
@@ -655,10 +733,20 @@ impl List {
             let header = row![
                 text(format!("Ask AI about: {pkg_name}")).style(style::Text::Default),
                 Space::new().width(Length::Fill),
+                tooltip(
+                    button(text("Clear"))
+                        .padding([2, 8])
+                        .on_press(Message::ChatClear),
+                    "Forget this conversation and ask again",
+                    tooltip::Position::Top,
+                )
+                .style(style::Container::Tooltip)
+                .gap(4),
                 button(text("Close"))
                     .padding([2, 8])
                     .on_press(Message::ChatClose),
             ]
+            .spacing(6)
             .align_y(Alignment::Center);
 
             let mut msgs = column![].spacing(6).padding([4, 0]);
@@ -684,21 +772,18 @@ impl List {
                 msgs = msgs.push(text("AI: …thinking").style(style::Text::Commentary));
             }
 
+            // Anchored to the bottom so a new reply is on screen as it lands,
+            // instead of leaving the user scrolled to the top of the answer.
             let history_scroll = scrollable(msgs)
                 .height(Length::Fill)
+                .anchor_bottom()
                 .style(style::Scrollable::Description);
 
-            let input_row = row![
-                text_input("Ask a question…", &self.chat_input)
-                    .on_input(Message::ChatInputChanged)
-                    .on_submit(Message::ChatSend)
-                    .padding([5, 10]),
-                button(text("Send"))
-                    .padding([5, 10])
-                    .on_press(Message::ChatSend),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center);
+            // Enter sends; no button, like a terminal prompt.
+            let input_row = text_input("Ask a question…", &self.chat_input)
+                .on_input(Message::ChatInputChanged)
+                .on_submit(Message::ChatSend)
+                .padding([5, 10]);
 
             container(column![header, history_scroll, input_row].spacing(6))
                 .padding(6)
@@ -1477,10 +1562,7 @@ impl List {
                     if new_chat {
                         self.chat_history.clear();
                         self.chat_input.clear();
-                        // Auto-ask the question users would type anyway.
-                        return self.send_chat_question(
-                            "What is this app for, and can uninstalling it break anything?",
-                        );
+                        return self.open_chat();
                     }
                     Task::none()
                 } else {

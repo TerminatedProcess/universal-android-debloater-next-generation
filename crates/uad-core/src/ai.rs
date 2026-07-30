@@ -35,6 +35,20 @@ pub struct AiInfo {
     /// breaking the Android system (not whether the user wants the app).
     #[serde(default)]
     pub safe_to_remove: String,
+    /// The conversation held about this package, replayed when the chat panel
+    /// is reopened. Asking the model to regenerate an answer it already gave
+    /// costs a round-trip and returns the same text, so the thread is kept
+    /// until the user explicitly clears it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chat: Vec<ChatTurn>,
+}
+
+/// One turn of a stored conversation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatTurn {
+    /// `true` for the user's question, `false` for the assistant's reply.
+    pub from_user: bool,
+    pub text: String,
 }
 
 impl AiInfo {
@@ -72,6 +86,32 @@ pub fn save_cache(cache: &AiCache) {
             }
         }
         Err(e) => warn!("Could not serialize AI cache: {e}"),
+    }
+}
+
+/// The stored conversation for a package, empty if none was held yet.
+#[must_use]
+pub fn cached_chat(pkg_id: &str) -> Vec<ChatTurn> {
+    load_cache()
+        .get(pkg_id)
+        .map(|info| info.chat.clone())
+        .unwrap_or_default()
+}
+
+/// Store a conversation, leaving any cached name/description intact.
+pub fn save_chat(pkg_id: &str, chat: Vec<ChatTurn>) {
+    let mut cache = load_cache();
+    cache.entry(pkg_id.to_string()).or_default().chat = chat;
+    save_cache(&cache);
+}
+
+/// Forget the conversation for a package. The cached name and description are
+/// kept — those are facts about the package, not a conversation.
+pub fn clear_chat(pkg_id: &str) {
+    let mut cache = load_cache();
+    if let Some(info) = cache.get_mut(pkg_id) {
+        info.chat.clear();
+        save_cache(&cache);
     }
 }
 
