@@ -1,6 +1,7 @@
 use crate::CACHE_DIR;
 use crate::CONFIG_DIR;
 use crate::sync::User;
+use crate::uad_lists::{PackageState, Removal, UadList};
 use crate::utils::DisplayablePath;
 use log::error;
 use serde::{Deserialize, Serialize};
@@ -20,8 +21,26 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_device_id: Option<String>,
     pub general: GeneralSettings,
+    #[serde(default)]
+    pub filters: FilterSettings,
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
     pub devices: Vec<DeviceSettings>,
+}
+
+/// Package-list filters, remembered across launches so the app reopens on the
+/// view the user left it in.
+///
+/// The field defaults deliberately match what the apps view used to hard-code
+/// (all lists / enabled / recommended), so a config without this table behaves
+/// exactly as before. The search box is intentionally *not* remembered — it is
+/// a transient lookup, not a view preference.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct FilterSettings {
+    pub list: UadList,
+    pub state: PackageState,
+    pub removal: Removal,
+    pub user_apps_only: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -82,15 +101,10 @@ impl Config {
         fs::write(&*CONFIG_FILE, toml).expect("Could not write config file to disk!");
     }
 
-    /// Persist the most recently selected device serial (`adb_id`), so it is
-    /// re-selected automatically on the next launch.
-    pub fn save_last_device(device_id: &str) {
-        let mut config = Self::load_configuration_file();
-        if config.last_device_id.as_deref() == Some(device_id) {
-            return; // already current — avoid a needless disk write
-        }
-        config.last_device_id = Some(device_id.to_string());
-        match toml::to_string(&config) {
+    /// Best-effort write of the whole config. Failures are logged, never fatal:
+    /// losing a remembered preference must not take the app down.
+    fn write(&self) {
+        match toml::to_string(self) {
             Ok(toml) => {
                 if let Err(e) = fs::write(&*CONFIG_FILE, toml) {
                     error!("Could not write config file to disk: {e}");
@@ -100,10 +114,38 @@ impl Config {
         }
     }
 
+    /// Persist the most recently selected device serial (`adb_id`), so it is
+    /// re-selected automatically on the next launch.
+    pub fn save_last_device(device_id: &str) {
+        let mut config = Self::load_configuration_file();
+        if config.last_device_id.as_deref() == Some(device_id) {
+            return; // already current — avoid a needless disk write
+        }
+        config.last_device_id = Some(device_id.to_string());
+        config.write();
+    }
+
     /// The most recently selected device serial (`adb_id`), if any.
     #[must_use]
     pub fn last_device_id() -> Option<String> {
         Self::load_configuration_file().last_device_id
+    }
+
+    /// Persist the apps-view filters. Re-reads from disk first so this can't
+    /// clobber settings changed elsewhere in the meantime.
+    pub fn save_filters(filters: &FilterSettings) {
+        let mut config = Self::load_configuration_file();
+        if config.filters == *filters {
+            return; // unchanged — avoid a needless disk write
+        }
+        config.filters.clone_from(filters);
+        config.write();
+    }
+
+    /// The filters to open the apps view with.
+    #[must_use]
+    pub fn filters() -> FilterSettings {
+        Self::load_configuration_file().filters
     }
 
     #[must_use]
@@ -198,5 +240,40 @@ mod tests {
         assert!(key_pos < table_pos, "scalar must precede tables:\n{toml}");
         let parsed: Config = toml::from_str(&toml).expect("deserialize");
         assert_eq!(parsed.last_device_id.as_deref(), Some("ABC123SERIAL"));
+    }
+
+    // In-memory only: these must not touch the real config file.
+    #[test]
+    fn test_filters_round_trip() {
+        let config = Config {
+            filters: FilterSettings {
+                list: UadList::Google,
+                state: PackageState::All,
+                removal: Removal::Advanced,
+                user_apps_only: true,
+            },
+            devices: vec![DeviceSettings::default()],
+            ..Config::default()
+        };
+        let toml = toml::to_string(&config).expect("serialize");
+        let parsed: Config = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(parsed.filters, config.filters);
+    }
+
+    // A config written by an older build has no `[filters]` table; it must load
+    // with the same defaults the apps view used to hard-code.
+    #[test]
+    fn test_config_without_filters_table() {
+        let old = r#"
+            [general]
+            theme = "Auto (follow system theme)"
+            expert_mode = false
+            backup_folder = "/tmp/backups"
+        "#;
+        let parsed: Config = toml::from_str(old).expect("deserialize");
+        assert_eq!(parsed.filters.list, UadList::All);
+        assert_eq!(parsed.filters.state, PackageState::Enabled);
+        assert_eq!(parsed.filters.removal, Removal::Recommended);
+        assert!(!parsed.filters.user_apps_only);
     }
 }
