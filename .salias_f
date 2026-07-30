@@ -15,31 +15,8 @@ end
 alias deploy='cargo install --path crates/uad-gui'
 
 # ── Fork sync ──
-function gitupdate --description "Sync fork from upstream: ff mirror (main), rebase work branch (mryan)"
-    set -l current (git branch --show-current)
-
-    # Guard: never run with uncommitted changes — a checkout could carry them onto the mirror branch.
-    if not git diff --quiet; or not git diff --cached --quiet
-        echo "Working tree dirty — commit or stash on your work branch first."
-        return 1
-    end
-
-    echo "Fetching upstream..."
-    git fetch upstream; or return 1
-
-    echo "Updating main (mirror)..."
-    git checkout main; or return 1
-    git merge upstream/main --ff-only; or begin
-        echo "ff-only failed: main has drifted from upstream. Move stray commits to mryan."
-        return 1
-    end
-    git push origin main
-
-    echo "Rebasing mryan onto main..."
-    git checkout mryan
-    git rebase main               # resolve conflicts here if prompted
-    git push origin mryan --force-with-lease
-
-    git checkout $current
-    echo "Synced: main mirrors upstream, mryan rebased on top."
-end
+# gitupdate is the global fish function (~/.config/fish/functions/gitupdate.fish).
+# This file used to carry a copy that ran `git rebase main` unchecked and then
+# force-pushed and checked out regardless of the result — a conflict left the
+# repo mid-rebase and pushed a half-synced branch. Do NOT redefine it here:
+# a local definition is sourced on dir-entry and shadows the global one.
