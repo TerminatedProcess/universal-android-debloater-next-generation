@@ -145,7 +145,11 @@ pub fn chat(system: &str, prompt: &str) -> Option<String> {
         Ok(mut resp) => {
             let val: serde_json::Value = resp.body_mut().read_json().ok()?;
             let content = val.get("content")?.as_str()?.trim().to_string();
-            if content.is_empty() { None } else { Some(content) }
+            if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            }
         }
         Err(e) => {
             warn!("AI chat failed: {e}");
