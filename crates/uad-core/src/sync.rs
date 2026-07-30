@@ -493,43 +493,63 @@ pub fn initial_load() -> bool {
     }
 }
 
-/// Get the current state of a package on a device
+/// Is `package_name` listed by `pm list packages <flag>` for this user?
+///
+/// Checks the system (`-s`) *and* third-party (`-3`) views. A system app that
+/// has an installed update is listed by both, and querying only one of them
+/// gives a wrong answer — see [`get_package_state`].
+fn package_in_lists(
+    device_serial: &str,
+    package_name: &str,
+    user_id: Option<u16>,
+    flag: crate::adb::PmListPacksFlag,
+) -> bool {
+    let listed = |packages: Result<Vec<String>, String>| {
+        packages.is_ok_and(|packages| packages.iter().any(|p| p == package_name))
+    };
+    listed(
+        AdbCommand::new()
+            .shell(device_serial)
+            .pm()
+            .list_packages_sys(Some(flag), user_id),
+    ) || listed(
+        AdbCommand::new()
+            .shell(device_serial)
+            .pm()
+            .list_packages_3rd(Some(flag), user_id),
+    )
+}
+
+/// Get the current state of a package on a device.
+///
+/// The check order matters. A system app carrying an installed update appears
+/// in both the `-s` and `-3` listings, and the `-s` view keeps reporting the
+/// factory APK as *enabled* even while the app is disabled for the user — only
+/// the `-d` listing reflects the truth. So "disabled" has to be asked first,
+/// otherwise a successful disable reads back as "still enabled", which makes
+/// callers think the command failed and escalate to
+/// [`attempt_fallback`] — which uninstalls the package.
+/// (Reproduced on an NVIDIA SHIELD with `com.amazon.amazonvideo.livingroom`.)
 #[must_use]
 pub fn get_package_state(
     device_serial: &str,
     package_name: &str,
     user_id: Option<u16>,
 ) -> Option<PackageState> {
-    use crate::adb::{ACommand as AdbCommand, PmListPacksFlag};
+    use crate::adb::PmListPacksFlag;
 
-    // Check if package is enabled
-    if let Ok(enabled_packages) = AdbCommand::new()
-        .shell(device_serial)
-        .pm()
-        .list_packages_sys(Some(PmListPacksFlag::OnlyEnabled), user_id)
-        && enabled_packages.contains(&package_name.to_string())
-    {
-        return Some(PackageState::Enabled);
-    }
-
-    // Check if package is disabled
-    if let Ok(disabled_packages) = AdbCommand::new()
-        .shell(device_serial)
-        .pm()
-        .list_packages_sys(Some(PmListPacksFlag::OnlyDisabled), user_id)
-        && disabled_packages.contains(&package_name.to_string())
-    {
-        return Some(PackageState::Disabled);
-    }
-
-    // Check if package exists at all (including uninstalled)
-    if let Ok(all_packages) = AdbCommand::new()
-        .shell(device_serial)
-        .pm()
-        .list_packages_sys(Some(PmListPacksFlag::IncludeUninstalled), user_id)
-        && all_packages.contains(&package_name.to_string())
-    {
-        return Some(PackageState::Uninstalled);
+    for (flag, state) in [
+        (PmListPacksFlag::OnlyDisabled, PackageState::Disabled),
+        (PmListPacksFlag::OnlyEnabled, PackageState::Enabled),
+        // Present, but neither enabled nor disabled for this user.
+        (
+            PmListPacksFlag::IncludeUninstalled,
+            PackageState::Uninstalled,
+        ),
+    ] {
+        if package_in_lists(device_serial, package_name, user_id, flag) {
+            return Some(state);
+        }
     }
 
     // Package not found at all - it doesn't exist on this device/user

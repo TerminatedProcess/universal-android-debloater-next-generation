@@ -149,10 +149,14 @@ pub fn fetch_packages(
             list = package.list;
         }
 
-        if enabled_sys_packs.contains(p_name) {
-            state = PackageState::Enabled;
-        } else if disabled_sys_packs.contains(p_name) {
+        // "Disabled" wins over "enabled": a system app with an installed update
+        // is listed by both `-s` and `-3`, and the `-s` view still reports the
+        // factory APK as enabled while the app is disabled for the user. Same
+        // precedence as `sync::get_package_state`, which see.
+        if disabled_sys_packs.contains(p_name) {
             state = PackageState::Disabled;
+        } else if enabled_sys_packs.contains(p_name) {
+            state = PackageState::Enabled;
         }
 
         let package = CorePackage {
